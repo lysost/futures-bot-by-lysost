@@ -6,6 +6,7 @@ from collections import deque
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 import talib
 import numpy as np
+from datetime import datetime, timedelta
 
 # Подключение к API Байбит
 class BybitAPI:
@@ -43,7 +44,8 @@ class NewsAPIHandler:
         self.base_url = "https://newsapi.org/v2/everything"
 
     def get_news(self, query):
-        url = f"{self.base_url}?q={query}&apiKey={self.current_key}"
+        today = datetime.utcnow().date()
+        url = f"{self.base_url}?q={query}&from={today}&sortBy=publishedAt&apiKey={self.current_key}"
         response = requests.get(url)
 
         if response.status_code == 200:
@@ -68,7 +70,7 @@ def send_telegram_message(message, token, chat_id):
         'chat_id': chat_id,
         'text': message
     }
-    response = requests.get(url, params=params)
+    response = requests.post(url, data=params)
     if response.status_code == 200:
         print(f"Сообщение успешно отправлено в Telegram: {message}")
     else:
@@ -81,7 +83,7 @@ def analyze_sentiment(news_data):
     negative_count = 0
 
     for article in news_data["articles"]:
-        sentiment = analyzer.polarity_scores(article["title"])
+        sentiment = analyzer.polarity_scores(article["title"] + " " + article["description"])  # Анализируем не только заголовок, но и описание статьи
         if sentiment['compound'] >= 0.05:
             positive_count += 1
         elif sentiment['compound'] <= -0.05:
@@ -96,43 +98,63 @@ class TradingBot:
         self.news_api_handler = news_api_handler
         self.telegram_token = telegram_token
         self.telegram_chat_id = telegram_chat_id
-        self.signal_accuracy = {}
-        self.analyzed_symbols = set()
+        self.signal_accuracy = {"total_signals": 0, "hit_tp": 0, "hit_sl": 0}
+        self.analyzed_symbols = set()  # Храним монеты, для которых уже был отправлен сигнал
 
     def analyze_market(self, symbol, timeframe):
         if symbol in self.analyzed_symbols:
-            return
+            return  # Если сигнал для этой монеты уже был отправлен, пропускаем
 
         print(f"Анализируем рынок для {symbol} на таймфрейме {timeframe}...")
+
+        # Получаем данные о рынке
         ohlcv, volumes = self.bybit_api.get_ohlcv(symbol, timeframe)
 
         if not ohlcv:
             print(f"Ошибка при получении данных для {symbol} на {timeframe}")
             return
 
-        closes = np.array([x[4] for x in ohlcv])
-        high_prices = np.array([x[2] for x in ohlcv])
-        low_prices = np.array([x[3] for x in ohlcv])
+        # Преобразуем список закрытых цен в numpy.ndarray
+        closes = np.array([x[4] for x in ohlcv])  # Закрытие цен
+        high_prices = np.array([x[2] for x in ohlcv])  # Высокие цены
+        low_prices = np.array([x[3] for x in ohlcv])  # Низкие цены
 
+        # Технический анализ (используем SMA для анализа тренда)
         indicators = self.calculate_indicators(closes, high_prices, low_prices)
         trend = "Восходящий" if indicators['sma_short'][-1] > indicators['sma_long'][-1] else "Нисходящий"
         print(f"Тренд для {symbol}: {trend}")
 
+        # Рассчитываем ATR (волатильность)
         atr = indicators['atr'][-1]
+
+        # Точка входа ТВХ (используем цену закрытия последней свечи)
         entry_price = closes[-1]
+
+        # Расчет TP и SL на основе ATR
         take_profit, stop_loss = self.calculate_tp_sl(entry_price, atr, trend)
+
+        # Генерация сигнала на основе тренда
         signal_type = "Лонг" if trend == "Восходящий" else "Шорт"
 
+        # Получаем новости по монете
         news_data = self.news_api_handler.get_news(symbol)
+        positive_count, negative_count = 0, 0
         if news_data:
-            print(f"Новости для {symbol}:")
-            for article in news_data["articles"]:
-                print(f"- {article['title']}")
+            # Анализируем настроения новостей
             positive_count, negative_count = analyze_sentiment(news_data)
-            print(f"Положительных новостей: {positive_count}, Отрицательных новостей: {negative_count}")
 
+        # Отправка сигнала и новостей в Telegram
         self.send_signal_to_telegram(symbol, signal_type, take_profit, stop_loss, entry_price, news_data)
+
+        # Добавляем монету в список проанализированных
         self.analyzed_symbols.add(symbol)
+
+        # Увеличиваем счетчики сигналов
+        self.signal_accuracy["total_signals"] += 1
+        if self.check_price_hit_tp_sl(symbol, entry_price, take_profit, stop_loss):
+            self.signal_accuracy["hit_tp"] += 1
+        else:
+            self.signal_accuracy["hit_sl"] += 1
 
     def calculate_indicators(self, closes, high_prices, low_prices):
         indicators = {}
@@ -142,6 +164,8 @@ class TradingBot:
         indicators['bollinger_upper'], indicators['bollinger_middle'], indicators['bollinger_lower'] = talib.BBANDS(closes, timeperiod=20)
         indicators['cci'] = talib.CCI(high_prices, low_prices, closes, timeperiod=14)
         indicators['atr'] = talib.ATR(high_prices, low_prices, closes, timeperiod=14)
+        indicators['rsi'] = talib.RSI(closes, timeperiod=14)  # Добавлен RSI
+        indicators['macd'], indicators['macd_signal'], indicators['macd_hist'] = talib.MACD(closes, fastperiod=12, slowperiod=26, signalperiod=9)  # Добавлен MACD
         return indicators
 
     def calculate_tp_sl(self, entry_price, atr, trend):
@@ -159,9 +183,16 @@ class TradingBot:
         message += f"ТП: {take_profit}\n"
         message += f"СЛ: {stop_loss}\n"
         message += "\nНовости:\n"
-        for article in news_data["articles"][:3]:
-            message += f"- {article['title']}\n"
+        for article in news_data["articles"][:3]:  # Берем только первые 3 статьи
+            message += f"- {article['title']} ({article.get('url', 'No URL provided')})\n"  # Добавляем ссылку на новость
+
         send_telegram_message(message, self.telegram_token, self.telegram_chat_id)
+
+    def check_price_hit_tp_sl(self, symbol, entry_price, take_profit, stop_loss):
+        # Проверка достижения ТП или СЛ (можно заменить на более сложную логику)
+        # Здесь подразумевается вызов функции, которая проверяет исторические данные
+        # или текущую цену, чтобы определить, достиг ли сигнал ТП или СЛ
+        return True  # Для примера всегда возвращаем True (ТП достигнут)
 
     def run(self):
         timeframes = ['1m', '5m', '15m']
