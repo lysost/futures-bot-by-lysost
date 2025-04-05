@@ -29,11 +29,11 @@ class BybitAPI:
     def get_ohlcv(self, symbol, timeframe='1m'):
         try:
             ohlcv = self.exchange.fetch_ohlcv(symbol, timeframe)
-            return ohlcv
+            volumes = [x[5] for x in ohlcv]  # Объемы торгов
+            return ohlcv, volumes
         except Exception as e:
             print(f"Ошибка при получении данных OHLCV: {e}")
-            return []
-
+            return [], []
 
 # Класс для обработки API новостей
 class NewsAPIHandler:
@@ -61,7 +61,6 @@ class NewsAPIHandler:
         self.current_key = self.api_keys[0]
         print(f"Используем следующий API-ключ: {self.current_key}")
 
-
 # Функция отправки сообщений в Telegram
 def send_telegram_message(message, token, chat_id):
     url = f"https://api.telegram.org/bot{token}/sendMessage"
@@ -74,7 +73,6 @@ def send_telegram_message(message, token, chat_id):
         print(f"Сообщение успешно отправлено в Telegram: {message}")
     else:
         print(f"Ошибка при отправке сообщения в Telegram: {response.status_code}")
-
 
 # Анализ настроений новостей
 def analyze_sentiment(news_data):
@@ -91,7 +89,6 @@ def analyze_sentiment(news_data):
 
     return positive_count, negative_count
 
-
 # Основной класс бота
 class TradingBot:
     def __init__(self, bybit_api, news_api_handler, telegram_token, telegram_chat_id):
@@ -100,86 +97,70 @@ class TradingBot:
         self.telegram_token = telegram_token
         self.telegram_chat_id = telegram_chat_id
         self.signal_accuracy = {}
-        self.analyzed_symbols = set()  # Храним монеты, для которых уже был отправлен сигнал
+        self.analyzed_symbols = set()
 
     def analyze_market(self, symbol, timeframe):
         if symbol in self.analyzed_symbols:
-            return  # Если сигнал для этой монеты уже был отправлен, пропускаем
+            return
 
         print(f"Анализируем рынок для {symbol} на таймфрейме {timeframe}...")
-
-        # Получаем данные о рынке
-        ohlcv = self.bybit_api.get_ohlcv(symbol, timeframe)
+        ohlcv, volumes = self.bybit_api.get_ohlcv(symbol, timeframe)
 
         if not ohlcv:
             print(f"Ошибка при получении данных для {symbol} на {timeframe}")
             return
 
-        # Преобразуем список закрытых цен в numpy.ndarray
-        closes = np.array([x[4] for x in ohlcv])  # Закрытие цен
-        high_prices = np.array([x[2] for x in ohlcv])  # Высокие цены
-        low_prices = np.array([x[3] for x in ohlcv])  # Низкие цены
+        closes = np.array([x[4] for x in ohlcv])
+        high_prices = np.array([x[2] for x in ohlcv])
+        low_prices = np.array([x[3] for x in ohlcv])
 
-        # Технический анализ (используем SMA для анализа тренда)
-        sma_short = talib.SMA(closes, timeperiod=50)  # Краткосрочная скользящая средняя
-        sma_long = talib.SMA(closes, timeperiod=200)  # Долгосрочная скользящая средняя
-
-        if sma_short[-1] > sma_long[-1]:
-            trend = "Восходящий"
-        else:
-            trend = "Нисходящий"
-
+        indicators = self.calculate_indicators(closes, high_prices, low_prices)
+        trend = "Восходящий" if indicators['sma_short'][-1] > indicators['sma_long'][-1] else "Нисходящий"
         print(f"Тренд для {symbol}: {trend}")
 
-        # Рассчитываем ATR (волатильность)
-        atr = talib.ATR(high_prices, low_prices, closes, timeperiod=14)[-1]  # ATR для оценки волатильности
-
-        # Точка входа ТВХ (используем цену закрытия последней свечи)
+        atr = indicators['atr'][-1]
         entry_price = closes[-1]
-
-        # Расчет TP и SL на основе ATR
-        if trend == "Восходящий":
-            take_profit = entry_price + atr  # TP = цена входа + волатильность
-            stop_loss = entry_price - atr  # SL = цена входа - волатильность
-        else:
-            take_profit = entry_price - atr  # TP = цена входа - волатильность
-            stop_loss = entry_price + atr  # SL = цена входа + волатильность
-
-        # Генерация сигнала на основе тренда
+        take_profit, stop_loss = self.calculate_tp_sl(entry_price, atr, trend)
         signal_type = "Лонг" if trend == "Восходящий" else "Шорт"
 
-        # Получаем новости по монете
         news_data = self.news_api_handler.get_news(symbol)
         if news_data:
             print(f"Новости для {symbol}:")
             for article in news_data["articles"]:
                 print(f"- {article['title']}")
-
-            # Анализируем настроения новостей
             positive_count, negative_count = analyze_sentiment(news_data)
             print(f"Положительных новостей: {positive_count}, Отрицательных новостей: {negative_count}")
 
-        # Отправка сигнала и новостей в Telegram
         self.send_signal_to_telegram(symbol, signal_type, take_profit, stop_loss, entry_price, news_data)
-
-        # Добавляем монету в список проанализированных
         self.analyzed_symbols.add(symbol)
 
-    def calculate_tp_sl(self, symbol):
-        # Простой расчет TP и SL для примера, можно заменить на более сложную логику
-        tp = 1.02  # Примерное значение TP
-        sl = 0.98  # Примерное значение SL
-        return tp, sl
+    def calculate_indicators(self, closes, high_prices, low_prices):
+        indicators = {}
+        indicators['sma_short'] = talib.SMA(closes, timeperiod=50)
+        indicators['sma_long'] = talib.SMA(closes, timeperiod=200)
+        indicators['ema'] = talib.EMA(closes, timeperiod=50)
+        indicators['bollinger_upper'], indicators['bollinger_middle'], indicators['bollinger_lower'] = talib.BBANDS(closes, timeperiod=20)
+        indicators['cci'] = talib.CCI(high_prices, low_prices, closes, timeperiod=14)
+        indicators['atr'] = talib.ATR(high_prices, low_prices, closes, timeperiod=14)
+        return indicators
 
-    def send_signal_to_telegram(self, symbol, signal_type, take_profit, stop_loss, news_data):
+    def calculate_tp_sl(self, entry_price, atr, trend):
+        if trend == "Восходящий":
+            take_profit = entry_price + atr
+            stop_loss = entry_price - atr
+        else:
+            take_profit = entry_price - atr
+            stop_loss = entry_price + atr
+        return take_profit, stop_loss
+
+    def send_signal_to_telegram(self, symbol, signal_type, take_profit, stop_loss, entry_price, news_data):
         message = f"Пара: {symbol}\n"
         message += f"Сигнал: {signal_type}\n"
         message += f"ТП: {take_profit}\n"
         message += f"СЛ: {stop_loss}\n"
         message += "\nНовости:\n"
-        for article in news_data["articles"][:3]:  # Берем только первые 3 статьи
+        for article in news_data["articles"][:3]:
             message += f"- {article['title']}\n"
-
         send_telegram_message(message, self.telegram_token, self.telegram_chat_id)
 
     def run(self):
@@ -193,7 +174,6 @@ class TradingBot:
             except Exception as e:
                 print(f"Ошибка в процессе анализа: {e}")
                 time.sleep(60)
-
 
 # Пример использования
 api_keys_news = [
@@ -214,5 +194,3 @@ trading_bot = TradingBot(bybit_api, news_api_handler, telegram_token, telegram_c
 
 # Запуск бота
 trading_bot.run()
-
-
